@@ -2,15 +2,18 @@
 //! Contains the compression attribute definition
 //! and methods to compress and decompress data.
 
+
+// private modules make non-breaking changes easier
 mod zip;
 mod rle;
 mod piz;
+mod pxr24;
 
 
-use crate::meta::Header;
-use crate::meta::attributes::IntRect;
+
+use crate::meta::attribute::IntRect;
 use crate::error::{Result, Error};
-
+use crate::meta::header::Header;
 
 
 /// A byte vector.
@@ -23,7 +26,7 @@ pub type Bytes<'s> = &'s [u8];
 /// Use uncompressed data for fastest loading and writing speeds.
 /// Use RLE compression for fast loading and writing with slight memory savings.
 /// Use ZIP compression for slow processing with large memory savings.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Compression {
 
     /// Store uncompressed values.
@@ -39,11 +42,13 @@ pub enum Compression {
 
     /// Uses ZIP compression to compress each line. Slowly produces small images
     /// which can be read with moderate speed. This compression method is lossless.
-    ZIP1,
+    /// Might be slightly faster but larger than `ZIP16´.
+    ZIP1, // TODO specify zip compression level?
 
     /// Uses ZIP compression to compress blocks of 16 lines. Slowly produces small images
     /// which can be read with moderate speed. This compression method is lossless.
-    ZIP16,
+    /// Might be slightly slower but smaller than `ZIP1´.
+    ZIP16, // TODO specify zip compression level?
 
     /// PIZ compression works well for noisy and natural images. Works better with larger tiles.
     /// Only supported for flat images, but not for deep data.
@@ -60,7 +65,8 @@ pub enum Compression {
     // tends to offset any size reduction of the input.)
     PIZ,
 
-    /// __This lossy compression is not yet supported by this implementation.__
+    /// Like `ZIP1`, but reduces precision of `f32` images to `f24`.
+    /// This produces really small image files. Only supported for flat images, not for deep data.
     // After reducing 32-bit floating-point data to 24 bits by rounding (while leaving 16-bit
     // floating-point data unchanged), differences between horizontally adjacent pixels
     // are compressed with zlib, similar to ZIP. PXR24 compression preserves image
@@ -72,7 +78,7 @@ pub enum Compression {
     // compression significantly by eliminating the pixels' 8 least significant bits, which
     // tend to be very noisy, and therefore difficult to compress.
     // PXR24 compression is only supported for flat images.
-    PXR24,
+    PXR24, // TODO specify zip compression level?
 
     /// __This lossy compression is not yet supported by this implementation.__
     // lossy 4-by-4 pixel block compression,
@@ -105,7 +111,7 @@ pub enum Compression {
     // value, which are packed into 3 instead of 14 bytes. For images with large uniform
     // areas, B44A produces smaller files than B44 compression.
     // B44A compression is only supported for flat images.
-    DWAA,
+    DWAA(Option<f32>), // TODO does this have a default value? make this non optional?
 
     /// __This lossy compression is not yet supported by this implementation.__
     // lossy DCT based compression, in blocks
@@ -124,7 +130,7 @@ impl std::fmt::Display for Compression {
             Compression::ZIP16 => "zip block",
             Compression::B44 => "b44",
             Compression::B44A => "b44a",
-            Compression::DWAA=> "dwaa",
+            Compression::DWAA(_) => "dwaa",
             Compression::DWAB => "dwab",
             Compression::PIZ => "piz",
             Compression::PXR24 => "pxr24",
@@ -137,51 +143,55 @@ impl std::fmt::Display for Compression {
 impl Compression {
 
     /// Compress the image section of bytes.
-    pub fn compress_image_section(self, header: &Header, packed: ByteVec, pixel_section: IntRect) -> Result<ByteVec> {
-        let dimensions = header.default_block_pixel_size();
-        assert!(pixel_section.validate(Some(dimensions)).is_ok(), "decompress tile coordinate bug");
+    pub fn compress_image_section(self, header: &Header, data: ByteVec, pixel_section: IntRect) -> Result<ByteVec> {
+        let max_tile_size = header.max_block_pixel_size();
+        assert!(pixel_section.validate(Some(max_tile_size)).is_ok(), "decompress tile coordinate bug");
 
         use self::Compression::*;
         let compressed = match self {
-            Uncompressed => return Ok(packed),
-            ZIP16 => zip::compress_bytes(&packed),
-            ZIP1 => zip::compress_bytes(&packed),
-            RLE => rle::compress_bytes(&packed),
-            PIZ => piz::compress_bytes(header, &packed, pixel_section),
+            Uncompressed => return Ok(data),
+            ZIP16 => zip::compress_bytes(&data),
+            ZIP1 => zip::compress_bytes(&data),
+            RLE => rle::compress_bytes(&data),
+            PIZ => piz::compress_bytes(&header.channels, &data, pixel_section),
+            PXR24 => pxr24::compress(&header.channels, &data, pixel_section),
             _ => return Err(Error::unsupported(format!("yet unimplemented compression method: {}", self)))
         };
 
         let compressed = compressed
             .map_err(|_| Error::invalid(format!("pixels cannot be compressed ({})", self)))?;
 
-        if compressed.len() < packed.len() {
-            Ok(compressed) // only return compressed data if it is smaller than uncompressed
+        if compressed.len() < data.len() {
+            // FIXME handle endianness
+            Ok(compressed)
         }
         else {
-            Ok(packed)
+            Ok(data)
         }
     }
 
     /// Decompress the image section of bytes.
     pub fn decompress_image_section(self, header: &Header, data: ByteVec, pixel_section: IntRect) -> Result<ByteVec> {
-        let dimensions = header.default_block_pixel_size();
-        assert!(pixel_section.validate(Some(dimensions)).is_ok(), "decompress tile coordinate bug");
+        let max_tile_size = header.max_block_pixel_size();
+        assert!(pixel_section.validate(Some(max_tile_size)).is_ok(), "decompress tile coordinate bug");
 
-        let expected_byte_size = dimensions.area() * header.channels.bytes_per_pixel; // FIXME this needs to account for subsampling anywhere
+        let expected_byte_size = pixel_section.size.area() * header.channels.bytes_per_pixel; // FIXME this needs to account for subsampling anywhere
 
         if data.len() == expected_byte_size {
-            Ok(data) // the raw data was smaller than the compressed data, so the raw data has been written
+            // FIXME handle endianness
+            Ok(data) // the compressed data was larger than the raw data, so the raw data has been written
         }
 
         else {
             use self::Compression::*;
             let bytes = match self {
                 Uncompressed => Ok(data),
-                ZIP16 => zip::decompress_bytes(&data, expected_byte_size),
-                ZIP1 => zip::decompress_bytes(&data, expected_byte_size),
+                ZIP16 => zip::decompress_bytes(&data),
+                ZIP1 => zip::decompress_bytes(&data),
                 RLE => rle::decompress_bytes(&data, expected_byte_size),
-                PIZ => piz::decompress_bytes(header, data, pixel_section, expected_byte_size),
-                _ => return Err(Error::unsupported(format!("yet unimplemented decompression method: {}", self)))
+                PIZ => piz::decompress_bytes(&header.channels, data, pixel_section, expected_byte_size),
+                PXR24 => pxr24::decompress(&header.channels, &data, pixel_section, expected_byte_size),
+                _ => return Err(Error::unsupported(format!("yet unimplemented compression method: {}", self)))
             };
 
             // map all errors to compression errors
@@ -225,10 +235,10 @@ impl Compression {
     pub fn scan_lines_per_block(self) -> usize {
         use self::Compression::*;
         match self {
-            Uncompressed | RLE   | ZIP1  => 1,
-            ZIP16 | PXR24                => 16,
-            PIZ   | B44   | B44A | DWAA  => 32,
-            DWAB                         => 256,
+            Uncompressed | RLE   | ZIP1    => 1,
+            ZIP16 | PXR24                  => 16,
+            PIZ   | B44   | B44A | DWAA(_) => 32,
+            DWAB                           => 256,
         }
     }
 

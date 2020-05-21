@@ -3,13 +3,15 @@
 extern crate exr;
 extern crate smallvec;
 
+use exr::prelude::common::*;
+
 use std::path::{PathBuf};
 use std::ffi::OsStr;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use exr::meta::{MetaData, Header};
 use std::io;
-use exr::prelude::*;
 use std::io::{Write, Cursor};
+use exr::image::rgba;
+use exr::meta::header::Header;
 
 fn exr_files() -> impl Iterator<Item=PathBuf> {
     walkdir::WalkDir::new("tests/images/valid").into_iter().map(std::result::Result::unwrap)
@@ -49,7 +51,10 @@ fn search_previews_of_all_files() {
 #[test]
 #[ignore]
 pub fn test_roundtrip() {
-    let path = "tests/images/valid/custom/crowskull/crow_piz_noisy_rgb.exr";
+    // let path = "tests/images/valid/openexr/TestImages/GammaChart.exr";
+    // let path = "tests/images/valid/custom/crowskull/crow_pxr24.exr";
+    // let path = "tests/images/valid/custom/crowskull/crow_piz_noisy_rgb.exr";
+    let path = "tests/images/valid/custom/crowskull/crow_rle.exr";
 
     print!("starting read 1... ");
     io::stdout().flush().unwrap();
@@ -57,25 +62,25 @@ pub fn test_roundtrip() {
     let meta = MetaData::read_from_file(path, false).unwrap();
     println!("{:#?}", meta);
 
-    let (image, pixels) = rgba::ImageInfo::read_pixels_from_file(
+    let (mut image, pixels) = rgba::ImageInfo::read_pixels_from_file(
         path, read_options::low(),
         rgba::pixels::create_flattened_f16,
         rgba::pixels::flattened_pixel_setter()
     ).unwrap();
     println!("...read 1 successfull");
 
-    let write_options = write_options::low();
+    image.encoding.compression = Compression::PIZ;
     let mut tmp_bytes = Vec::new();
 
     print!("starting write... ");
     io::stdout().flush().unwrap();
 
     image.write_pixels_to_buffered(
-        &mut Cursor::new(&mut tmp_bytes), write_options,
+        &mut Cursor::new(&mut tmp_bytes), write_options::low(),
         rgba::pixels::flattened_pixel_getter(&pixels)
     ).unwrap();
 
-    println!("...write successfull");
+    println!("...write successfull: {}mb", tmp_bytes.len() as f32/ 1000000.0);
 
     print!("starting read 2... ");
     io::stdout().flush().unwrap();
